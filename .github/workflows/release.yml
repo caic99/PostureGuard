@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .app bundle
+        run: ./make-app.sh
+
+      - name: Zip app
+        run: ditto -c -k --keepParent build/PostureGuard.app build/PostureGuard.app.zip
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/PostureGuard.app.zip
+          generate_release_notes: true

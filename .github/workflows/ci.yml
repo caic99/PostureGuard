@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build app bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Assemble .app bundle
+        run: ./make-app.sh
+
+      - name: Verify bundle
+        run: |
+          test -x build/PostureGuard.app/Contents/MacOS/PostureGuard
+          plutil -lint build/PostureGuard.app/Contents/Info.plist
+          codesign --verify --verbose build/PostureGuard.app
+
+      - name: Zip app
+        run: ditto -c -k --keepParent build/PostureGuard.app build/PostureGuard.app.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PostureGuard.app
+          path: build/PostureGuard.app.zip
+          retention-days: 14
