@@ -42,13 +42,18 @@ true head pitch (vs. horizontal, positive = up)
    automatically shrinks to ⅓ (min 30 s, shown with ⚡ in the menu); on
    battery it returns to the configured value. The first burst doubles as
    baseline calibration — just sit straight.
-5. **Judgment** — if a check finds your head more than 15° (configurable)
-   below the calibrated baseline, it doesn't alert immediately: it re-checks
-   60 seconds later, and only two consecutive bad checks trigger a
-   notification + sound (optional voice). Bending down to pick something up
-   won't nag you. Detection is suspended when your head is turned away
-   (|yaw| > 35°) or you leave. A continuous "realtime" mode (camera always
-   on, ~0.5–1 W) is available mainly for debugging.
+5. **Escalating judgment** — when a check finds your head more than 15°
+   (configurable) below the baseline, the app escalates instead of just
+   alerting: it switches to **continuous tracking** (camera stays on) until
+   you recover. During tracking, slouching sustained for 10 s (configurable)
+   triggers a notification + sound (optional voice), at most once per minute.
+   Once posture stays good for 30 s, tracking ends and a **vigilant period**
+   begins — checks every minute for 10 minutes — before returning to the
+   normal cadence. Tracking also ends if you walk away (30 s without a face)
+   or after a 10-minute cap. Bending down to pick something up won't nag you;
+   judgment is suspended while your head is turned away (|yaw| > 35°). A
+   permanent realtime mode (~0.5–1 W) remains available, mainly for
+   debugging.
 
 ## Install
 

@@ -21,7 +21,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleIdentifier</key>       <string>com.chucai.posture-guard</string>
     <key>CFBundleName</key>             <string>PostureGuard</string>
     <key>CFBundleDisplayName</key>      <string>坐姿卫士</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleShortVersionString</key><string>1.1</string>
     <key>LSMinimumSystemVersion</key>   <string>13.0</string>
     <key>LSUIElement</key>              <true/>
     <key>NSCameraUsageDescription</key> <string>用摄像头检测人脸朝向，结合屏幕开合角度监测低头坐姿。画面只在本机实时分析，不保存、不上传。</string>

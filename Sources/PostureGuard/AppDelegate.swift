@@ -9,9 +9,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var monitor: PostureMonitor!
     private var paused = false
 
-    // Duty-cycle (burst) mode state, active when checkIntervalSec > 0: the
-    // camera only runs for `burstSec` per check, then a timer schedules the
-    // next one. A bad check is rechecked after `recheckSec` before alerting.
+    /// Escalation ladder for duty-cycle mode (checkIntervalSec > 0):
+    /// - normal:   short camera bursts every effectiveCheckInterval
+    /// - tracking: a burst saw bad posture → camera stays on continuously
+    ///             until posture recovers (or the user leaves / cap expires)
+    /// - vigilant: just recovered → bursts at a raised cadence for a while
+    private enum Phase { case normal, tracking, vigilant }
+    private var phase: Phase = .normal
+
+    /// What the camera delegate should do with frames. Written on the main
+    /// thread before the camera starts, read on the camera queue.
+    private enum CaptureMode { case burst, continuous }
+    private var captureMode: CaptureMode = .burst
+
     private var burstTimer: Timer?
     private var bursting = false
     private var burstID = 0
@@ -19,10 +29,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var burstVisions: [Double] = []
     private var burstFrames = 0
     private var lastCheck: Date?
-    private var lastState: PostureState = .noFace
     private let burstSec: TimeInterval = 8
-    private let recheckSec: TimeInterval = 60
     private let burstWarmupFrames = 2
+
+    private var trackingStart: Date?
+    private var trackingGoodSince: Date?
+    private var trackingNoFaceSince: Date?
+    private var vigilantUntil: Date?
+    /// Sustained recovery required to leave tracking.
+    private let recoverySec: TimeInterval = 30
+    /// Hard cap on a tracking session — alerts have fired by then; go back to
+    /// bursts instead of running the camera forever.
+    private let trackingCapSec: TimeInterval = 600
+    /// No face this long during tracking = the user walked away.
+    private let trackingNoFaceExitSec: TimeInterval = 30
+    private let vigilantIntervalSec: TimeInterval = 60
+    private let vigilantDurationSec: TimeInterval = 600
 
     // On AC power there's no battery to protect — check 3x as often.
     private let power = PowerSource()
@@ -62,15 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor = PostureMonitor(config: config)
         monitor.onSample = { [weak self] s in
             self?.debugPrint(s)
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.render(s)
-                // In burst mode each check emits exactly one sample after the
-                // camera stops — that's the moment to plan the next check.
-                if !self.isRealtime && !self.bursting && !self.paused {
-                    self.scheduleNextBurst(after: s.state)
-                }
-            }
+            DispatchQueue.main.async { self?.handleSample(s) }
         }
         monitor.onAlert = { [weak self] deviation in
             let voice = self?.config.voice ?? false
@@ -83,15 +97,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        log("摄像头 TCC 状态: \(AVCaptureDevice.authorizationStatus(for: .video).rawValue) (0=未询问 1=受限 2=拒绝 3=已授权)")
         power.onChange = { [weak self] in
             guard let self, !self.isRealtime, !self.paused, !self.bursting,
-                  self.burstTimer != nil else { return }
+                  self.phase != .tracking, self.burstTimer != nil else { return }
             if self.config.debug { self.log("电源状态变化 (AC=\(PowerSource.isOnAC()))，重新调度") }
-            self.scheduleNextBurst(after: self.lastState)
+            self.scheduleNextBurst()
         }
         power.startObserving()
 
+        log("摄像头 TCC 状态: \(AVCaptureDevice.authorizationStatus(for: .video).rawValue) (0=未询问 1=受限 2=拒绝 3=已授权)")
         FacePitchDetector.ensureCameraAccess { [weak self] granted in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -114,9 +128,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let d = FacePitchDetector(interval: config.sampleInterval)
             d.onReading = { [weak self] face in
                 guard let self else { return }
-                if self.isRealtime {
+                switch self.captureMode {
+                case .continuous:
                     self.monitor.process(face: face, lidAngle: self.lid?.read())
-                } else {
+                case .burst:
                     let head = face.flatMap {
                         PostureMonitor.headPitch(face: $0, lid: self.lid?.read(), config: self.config)
                     }
@@ -126,25 +141,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             detector = d
         }
         if isRealtime {
+            monitor.beginContinuous()
+            captureMode = .continuous
             do { try detector?.start() } catch { cameraFailed(error) }
         } else {
             performBurst()
         }
     }
 
-    private func restartMonitoring() {
+    private func stopAllMonitoring() {
         burstTimer?.invalidate()
         burstTimer = nil
         bursting = false
+        phase = .normal
+        trackingStart = nil
+        vigilantUntil = nil
         detector?.stop()
+    }
+
+    private func restartMonitoring() {
+        stopAllMonitoring()
         guard !paused else { return }
         startMonitoring()
     }
+
+    /// Routes every sample from the monitor to the right scheduler reaction.
+    private func handleSample(_ s: PostureSample) {
+        render(s)
+        guard !paused, !isRealtime else { return }
+        switch phase {
+        case .tracking:
+            handleTrackingSample(s)
+        case .normal, .vigilant:
+            // Only burst results drive scheduling; leftover continuous frames
+            // from a just-ended tracking session are render-only.
+            guard !bursting, s.fromBurst else { return }
+            afterBurst(s)
+        }
+    }
+
+    // MARK: - Burst phase
 
     private func performBurst() {
         guard !paused, !bursting else { return }
         burstTimer?.invalidate()
         burstTimer = nil
+        captureMode = .burst
         bursting = true
         burstID += 1
         let id = burstID
@@ -184,21 +226,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.processBurst(head: head, visionPitch: median(burstVisions), lidAngle: lid?.read())
     }
 
-    private func scheduleNextBurst(after state: PostureState) {
-        lastState = state
-        burstTimer?.invalidate()
-        let delay: TimeInterval
-        switch state {
+    private func afterBurst(_ s: PostureSample) {
+        switch s.state {
         case .slouching, .alerting:
-            delay = recheckSec
+            enterTracking()
         default:
-            delay = effectiveCheckInterval
+            if phase == .vigilant, let until = vigilantUntil, Date() >= until {
+                phase = .normal
+                vigilantUntil = nil
+                if config.debug { log("加强观察期结束，恢复常规间隔") }
+            }
+            scheduleNextBurst()
         }
+    }
+
+    private func scheduleNextBurst() {
+        burstTimer?.invalidate()
+        let delay = phase == .vigilant
+            ? min(vigilantIntervalSec, effectiveCheckInterval)
+            : effectiveCheckInterval
         let t = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
             self?.performBurst()
         }
         RunLoop.main.add(t, forMode: .common)
         burstTimer = t
+    }
+
+    // MARK: - Tracking phase (continuous camera until recovery)
+
+    private func enterTracking() {
+        burstTimer?.invalidate()
+        burstTimer = nil
+        phase = .tracking
+        trackingStart = Date()
+        trackingGoodSince = nil
+        trackingNoFaceSince = nil
+        log("巡检发现低头 → 进入实时跟踪")
+        monitor.beginContinuous()
+        captureMode = .continuous
+        do { try detector?.start() } catch {
+            phase = .normal
+            cameraFailed(error)
+            scheduleNextBurst() // keep monitoring alive even if this start failed
+        }
+    }
+
+    private func handleTrackingSample(_ s: PostureSample) {
+        let now = Date()
+        let recovered = (s.deviationDeg ?? -999) >= -max(0, config.thresholdDeg - config.hysteresisDeg)
+
+        switch s.state {
+        case .good where recovered:
+            trackingNoFaceSince = nil
+            if trackingGoodSince == nil { trackingGoodSince = now }
+            if now.timeIntervalSince(trackingGoodSince!) >= recoverySec {
+                log("姿势已恢复 → 转入加强观察")
+                exitTracking(to: .vigilant)
+                return
+            }
+        case .good, .slouching, .alerting, .calibrating:
+            trackingGoodSince = nil
+            trackingNoFaceSince = nil
+        case .noFace:
+            trackingGoodSince = nil
+            if trackingNoFaceSince == nil { trackingNoFaceSince = now }
+            if now.timeIntervalSince(trackingNoFaceSince!) >= trackingNoFaceExitSec {
+                log("跟踪期间人已离开 → 回到常规巡检")
+                exitTracking(to: .normal)
+                return
+            }
+        case .paused:
+            return
+        }
+
+        if let start = trackingStart, now.timeIntervalSince(start) >= trackingCapSec {
+            log("实时跟踪达到时长上限 → 转入加强观察")
+            exitTracking(to: .vigilant)
+        }
+    }
+
+    private func exitTracking(to next: Phase) {
+        detector?.stop()
+        captureMode = .burst
+        trackingStart = nil
+        trackingGoodSince = nil
+        trackingNoFaceSince = nil
+        phase = next
+        if next == .vigilant {
+            vigilantUntil = Date().addingTimeInterval(vigilantDurationSec)
+        }
+        scheduleNextBurst()
     }
 
     private func median(_ xs: [Double]) -> Double? {
@@ -286,10 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.recalibrate()
         Notifier.notification(title: "坐姿卫士", body: "请以标准坐姿面对屏幕，正在采样校准…")
         if !isRealtime {
-            burstTimer?.invalidate()
-            burstTimer = nil
-            bursting = false
-            detector?.stop()
+            stopAllMonitoring()
             performBurst()
         }
     }
@@ -298,10 +412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         paused.toggle()
         monitor.setPaused(paused)
         if paused {
-            burstTimer?.invalidate()
-            burstTimer = nil
-            bursting = false
-            detector?.stop()
+            stopAllMonitoring()
             statusItem.button?.title = "🪑⏸"
         } else {
             startMonitoring()
@@ -369,13 +480,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let p = s.visionPitchDeg { bottom.append(String(format: "人脸 %+.1f°", p)) }
         var lines = [top, bottom].filter { !$0.isEmpty }.map { $0.joined(separator: " · ") }
         if !isRealtime {
-            let iv = effectiveCheckInterval
-            var status = iv >= 60
-                ? "每 \(Int(iv / 60)) 分钟"
-                : "每 \(Int(iv)) 秒"
-            if PowerSource.isOnAC() { status += "⚡" }
-            if case .slouching = s.state { status = "1 分钟后复查" }
-            if let lc = lastCheck { status += " · 上次 " + Self.timeFmt.string(from: lc) }
+            var status: String
+            switch phase {
+            case .tracking:
+                status = "实时跟踪中，恢复坐姿后解除"
+            case .vigilant:
+                let iv = Int(min(vigilantIntervalSec, effectiveCheckInterval))
+                status = "加强观察 · 每 \(iv >= 60 ? "\(iv / 60) 分钟" : "\(iv) 秒")"
+            case .normal:
+                let iv = effectiveCheckInterval
+                status = iv >= 60 ? "每 \(Int(iv / 60)) 分钟" : "每 \(Int(iv)) 秒"
+                if PowerSource.isOnAC() { status += "⚡" }
+            }
+            if phase != .tracking, let lc = lastCheck {
+                status += " · 上次 " + Self.timeFmt.string(from: lc)
+            }
             lines.append(status)
         }
         let text = lines.isEmpty ? "未检测到人脸" : lines.joined(separator: "\n")

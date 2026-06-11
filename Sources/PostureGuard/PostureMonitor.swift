@@ -21,6 +21,12 @@ struct PostureSample {
     /// smoothed - neutral; negative = head lower than calibrated posture.
     var deviationDeg: Double?
     var state: PostureState = .noFace
+    /// True when this sample is the median result of a camera burst (one per
+    /// check), false for continuous 2 Hz samples. The scheduler only reacts
+    /// to burst results when planning checks — leftover continuous samples
+    /// arriving right after a tracking session ends must not be mistaken for
+    /// a fresh check result.
+    var fromBurst = false
 }
 
 /// Combines lid angle and face pitch into a gravity-referenced head pitch,
@@ -42,8 +48,6 @@ final class PostureMonitor {
     private var badSince: Date?
     private var lastAlert: Date?
     private var paused = false
-    /// Burst mode: the previous check found bad posture; the next one confirms.
-    private var suspect = false
 
     var onSample: ((PostureSample) -> Void)?
     var onAlert: ((Double) -> Void)?
@@ -67,14 +71,25 @@ final class PostureMonitor {
     }
 
     /// Duty-cycle entry point: one median head pitch per camera burst.
-    /// First bad check only marks suspicion; the follow-up check confirms and
-    /// alerts — the burst-mode equivalent of "sustained for N seconds".
+    /// A bad check never alerts by itself — it reports `.slouching`, which the
+    /// scheduler answers by escalating to continuous tracking (`process`),
+    /// where the sustained-duration logic confirms and alerts.
     func processBurst(head: Double?, visionPitch: Double?, lidAngle: Double?) {
         q.async { self._processBurst(head: head, visionPitch: visionPitch, lidAngle: lidAngle) }
     }
 
+    /// Reset per-session signal state before a continuous tracking session so
+    /// stale smoothing/duration from an earlier session can't trigger instantly.
+    func beginContinuous() {
+        q.async {
+            self.smoothed = nil
+            self.badSince = nil
+        }
+    }
+
     private func _processBurst(head: Double?, visionPitch: Double?, lidAngle: Double?) {
         var sample = PostureSample(lidAngle: lidAngle, visionPitchDeg: visionPitch)
+        sample.fromBurst = true
         sample.headPitchDeg = head
         if paused {
             sample.state = .paused
@@ -82,7 +97,6 @@ final class PostureMonitor {
             return
         }
         guard let head else {
-            suspect = false
             sample.state = .noFace
             onSample?(sample)
             return
@@ -103,21 +117,7 @@ final class PostureMonitor {
         let deviation = head - neutral
         sample.deviationDeg = deviation
 
-        if deviation <= -config.thresholdDeg {
-            if suspect {
-                sample.state = .alerting
-                if lastAlert == nil || Date().timeIntervalSince(lastAlert!) >= config.cooldownSec {
-                    lastAlert = Date()
-                    onAlert?(deviation)
-                }
-            } else {
-                suspect = true
-                sample.state = .slouching(seconds: 0)
-            }
-        } else {
-            suspect = false
-            sample.state = .good
-        }
+        sample.state = deviation <= -config.thresholdDeg ? .slouching(seconds: 0) : .good
         onSample?(sample)
     }
 
@@ -128,7 +128,6 @@ final class PostureMonitor {
             self.calibrationBuf.removeAll()
             self.calibrationStart = nil
             self.badSince = nil
-            self.suspect = false
             self.defaults.removeObject(forKey: "neutralDeg")
         }
     }
@@ -136,10 +135,7 @@ final class PostureMonitor {
     func setPaused(_ p: Bool) {
         q.async {
             self.paused = p
-            if p {
-                self.badSince = nil
-                self.suspect = false
-            }
+            if p { self.badSince = nil }
         }
     }
 
@@ -214,7 +210,7 @@ final class PostureMonitor {
                 sample.state = .slouching(seconds: dur)
             }
         } else {
-            if deviation >= -(config.thresholdDeg - config.hysteresisDeg) {
+            if deviation >= -max(0, config.thresholdDeg - config.hysteresisDeg) {
                 badSince = nil
             }
             sample.state = .good
