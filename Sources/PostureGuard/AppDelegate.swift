@@ -97,6 +97,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification, object: nil)
+
         power.onChange = { [weak self] in
             guard let self, !self.isRealtime, !self.paused, !self.bursting,
                   self.phase != .tracking, self.burstTimer != nil else { return }
@@ -397,6 +401,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pauseItem.title = paused ? "继续监测" : "暂停监测"
     }
 
+    /// On wake, don't sit out the rest of a pre-sleep interval — check now.
+    /// A short delay lets the camera hardware come back first.
+    @objc private func systemDidWake() {
+        guard !paused else { return }
+        if config.debug { log("系统唤醒") }
+        if isRealtime || phase == .tracking {
+            // Sleep interrupts the capture session; restarting a running
+            // session is a no-op, so this is safe either way.
+            try? detector?.start()
+            return
+        }
+        statusItem.button?.title = "🪑…"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, !self.paused, !self.bursting, self.phase != .tracking else { return }
+            if self.config.debug { self.log("系统唤醒 → 立即巡检") }
+            self.performBurst()
+        }
+    }
+
     // MARK: - Actions
 
     @objc private func recalibrate() {
@@ -415,6 +438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stopAllMonitoring()
             statusItem.button?.title = "🪑⏸"
         } else {
+            // First sample is seconds away (a burst takes ~8 s) — show a
+            // transitional state instead of a stale pause icon.
+            statusItem.button?.title = "🪑…"
             startMonitoring()
         }
         refreshCheckmarks()
