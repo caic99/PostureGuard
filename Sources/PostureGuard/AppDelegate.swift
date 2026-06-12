@@ -59,6 +59,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var showAngleItem: NSMenuItem!
     private var thresholdMenu: NSMenu!
     private var intervalMenu: NSMenu!
+    private var languageMenu: NSMenu!
+    private var lowPowerItem: NSMenuItem!
+    private var lastSample: PostureSample?
+    /// Monitoring is currently held off because of Low Power Mode.
+    private var lowPowerSuspended = false
+
+    private var lowPowerBlocks: Bool {
+        ProcessInfo.processInfo.isLowPowerModeEnabled && !config.runInLowPower
+    }
 
     private var isRealtime: Bool { config.checkIntervalSec <= 0 }
 
@@ -93,13 +102,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.onCalibrated = { [weak self] n in
             self?.log(String(format: "已校准基准头部俯仰 %.1f°", n))
             DispatchQueue.main.async {
-                Notifier.notification(title: "坐姿卫士", body: String(format: "已校准基准姿势（%.1f°），开始监测", n))
+                Notifier.notification(
+                    title: tr("坐姿卫士", "PostureGuard"),
+                    body: L10n.isChinese
+                        ? String(format: "已校准基准姿势（%.1f°），开始监测", n)
+                        : String(format: "Baseline calibrated (%.1f°) — monitoring started", n))
             }
         }
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(systemDidWake),
             name: NSWorkspace.didWakeNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(powerStateChanged),
+            name: .NSProcessInfoPowerStateDidChange, object: nil)
 
         power.onChange = { [weak self] in
             guard let self, !self.isRealtime, !self.paused, !self.bursting,
@@ -119,7 +135,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     self.statusItem.button?.title = "🪑📷✕"
                     self.log("没有摄像头权限：系统设置 → 隐私与安全性 → 摄像头")
-                    Notifier.notification(title: "坐姿卫士", body: "没有摄像头权限，请在 系统设置 → 隐私与安全性 → 摄像头 中授权后重启应用")
+                    Notifier.notification(
+                        title: tr("坐姿卫士", "PostureGuard"),
+                        body: tr("没有摄像头权限，请在 系统设置 → 隐私与安全性 → 摄像头 中授权后重启应用",
+                                 "No camera access. Grant it in System Settings → Privacy & Security → Camera, then relaunch."))
                 }
             }
         }
@@ -128,6 +147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Monitoring lifecycle
 
     private func startMonitoring() {
+        if lowPowerBlocks {
+            lowPowerSuspended = true
+            showLowPowerStatus()
+            return
+        }
+        lowPowerSuspended = false
         if detector == nil {
             let d = FacePitchDetector(interval: config.sampleInterval)
             d.onReading = { [weak self] face in
@@ -171,6 +196,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Routes every sample from the monitor to the right scheduler reaction.
     private func handleSample(_ s: PostureSample) {
+        // In-flight samples right after a low-power suspension would overwrite
+        // the 🔋 status — drop them.
+        guard !lowPowerSuspended else { return }
+        lastSample = s
         render(s)
         guard !paused, !isRealtime else { return }
         switch phase {
@@ -187,7 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Burst phase
 
     private func performBurst() {
-        guard !paused, !bursting else { return }
+        guard !paused, !bursting, !lowPowerSuspended else { return }
         burstTimer?.invalidate()
         burstTimer = nil
         captureMode = .burst
@@ -337,24 +366,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildMenu() {
         let menu = NSMenu()
 
-        infoLine = NSMenuItem(title: "等待数据…", action: nil, keyEquivalent: "")
+        infoLine = NSMenuItem(title: tr("等待数据…", "Waiting for data…"), action: nil, keyEquivalent: "")
         infoLine.isEnabled = false
         menu.addItem(infoLine)
         menu.addItem(.separator())
 
-        let cal = NSMenuItem(title: "以当前姿势重新校准", action: #selector(recalibrate), keyEquivalent: "c")
+        let cal = NSMenuItem(title: tr("以当前姿势重新校准", "Recalibrate to Current Posture"),
+                             action: #selector(recalibrate), keyEquivalent: "c")
         cal.target = self
         menu.addItem(cal)
 
-        pauseItem = NSMenuItem(title: "暂停监测", action: #selector(togglePause), keyEquivalent: "p")
+        pauseItem = NSMenuItem(title: "", action: #selector(togglePause), keyEquivalent: "p")
         pauseItem.target = self
         menu.addItem(pauseItem)
         menu.addItem(.separator())
 
-        let thresholdItem = NSMenuItem(title: "提醒阈值", action: nil, keyEquivalent: "")
+        let thresholdItem = NSMenuItem(title: tr("提醒阈值", "Alert Threshold"), action: nil, keyEquivalent: "")
         thresholdMenu = NSMenu()
         for v in [10.0, 15.0, 20.0, 25.0] {
-            let i = NSMenuItem(title: "低头 \(Int(v))°", action: #selector(setThreshold(_:)), keyEquivalent: "")
+            let i = NSMenuItem(title: L10n.isChinese ? "低头 \(Int(v))°" : "Head down \(Int(v))°",
+                               action: #selector(setThreshold(_:)), keyEquivalent: "")
             i.target = self
             i.representedObject = v
             thresholdMenu.addItem(i)
@@ -362,9 +393,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         thresholdItem.submenu = thresholdMenu
         menu.addItem(thresholdItem)
 
-        let intervalItem = NSMenuItem(title: "检测间隔", action: nil, keyEquivalent: "")
+        let intervalItem = NSMenuItem(title: tr("检测间隔", "Check Interval"), action: nil, keyEquivalent: "")
         intervalMenu = NSMenu()
-        for (label, v) in [("实时（耗电）", 0.0), ("每 1 分钟", 60.0), ("每 3 分钟", 180.0), ("每 5 分钟", 300.0)] {
+        let intervalOptions: [(String, Double)] = [
+            (tr("实时（耗电）", "Realtime (power-hungry)"), 0.0),
+            (tr("每 1 分钟", "Every minute"), 60.0),
+            (tr("每 3 分钟", "Every 3 minutes"), 180.0),
+            (tr("每 5 分钟", "Every 5 minutes"), 300.0),
+        ]
+        for (label, v) in intervalOptions {
             let i = NSMenuItem(title: label, action: #selector(setInterval(_:)), keyEquivalent: "")
             i.target = self
             i.representedObject = v
@@ -373,16 +410,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         intervalItem.submenu = intervalMenu
         menu.addItem(intervalItem)
 
-        showAngleItem = NSMenuItem(title: "菜单栏显示角度", action: #selector(toggleShowAngle), keyEquivalent: "")
+        showAngleItem = NSMenuItem(title: tr("菜单栏显示角度", "Show Angle in Menu Bar"),
+                                   action: #selector(toggleShowAngle), keyEquivalent: "")
         showAngleItem.target = self
         menu.addItem(showAngleItem)
 
-        voiceItem = NSMenuItem(title: "语音提醒", action: #selector(toggleVoice), keyEquivalent: "")
+        voiceItem = NSMenuItem(title: tr("语音提醒", "Voice Alerts"),
+                               action: #selector(toggleVoice), keyEquivalent: "")
         voiceItem.target = self
         menu.addItem(voiceItem)
+
+        lowPowerItem = NSMenuItem(title: tr("低电量模式下仍监测", "Keep Monitoring in Low Power Mode"),
+                                  action: #selector(toggleLowPower), keyEquivalent: "")
+        lowPowerItem.target = self
+        menu.addItem(lowPowerItem)
+
+        let languageItem = NSMenuItem(title: tr("语言 Language", "Language 语言"), action: nil, keyEquivalent: "")
+        languageMenu = NSMenu()
+        let languageOptions: [(String, AppLanguage)] = [
+            (tr("跟随系统", "System Default"), .system),
+            ("中文", .chinese),
+            ("English", .english),
+        ]
+        for (label, v) in languageOptions {
+            let i = NSMenuItem(title: label, action: #selector(setLanguage(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = v.rawValue
+            languageMenu.addItem(i)
+        }
+        languageItem.submenu = languageMenu
+        menu.addItem(languageItem)
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: tr("退出", "Quit"),
+                              action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
 
         statusItem.menu = menu
@@ -396,15 +457,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for i in intervalMenu.items {
             i.state = (i.representedObject as? Double) == config.checkIntervalSec ? .on : .off
         }
+        for i in languageMenu.items {
+            i.state = (i.representedObject as? String) == config.language.rawValue ? .on : .off
+        }
         showAngleItem.state = config.showAngle ? .on : .off
         voiceItem.state = config.voice ? .on : .off
-        pauseItem.title = paused ? "继续监测" : "暂停监测"
+        lowPowerItem.state = config.runInLowPower ? .on : .off
+        pauseItem.title = paused
+            ? tr("继续监测", "Resume Monitoring")
+            : tr("暂停监测", "Pause Monitoring")
+    }
+
+    /// The system entered or left Low Power Mode, or the user flipped the
+    /// "keep monitoring" switch — reconcile the suspension state.
+    @objc private func powerStateChanged() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.lowPowerBlocks, !self.lowPowerSuspended, !self.paused {
+                if self.config.debug { self.log("进入低电量模式 → 暂停监测") }
+                self.stopAllMonitoring()
+                self.lowPowerSuspended = true
+                self.showLowPowerStatus()
+            } else if !self.lowPowerBlocks, self.lowPowerSuspended {
+                if self.config.debug { self.log("低电量限制解除 → 恢复监测") }
+                self.lowPowerSuspended = false
+                guard !self.paused else { return }
+                self.statusItem.button?.title = "🪑…"
+                self.startMonitoring()
+            }
+        }
+    }
+
+    private func showLowPowerStatus() {
+        statusItem.button?.title = "🪑🪫"
+        let para = NSMutableParagraphStyle()
+        para.lineSpacing = 2
+        infoLine.attributedTitle = NSAttributedString(
+            string: tr("低电量模式，监测已暂停", "Low Power Mode — monitoring suspended"),
+            attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .paragraphStyle: para])
     }
 
     /// On wake, don't sit out the rest of a pre-sleep interval — check now.
     /// A short delay lets the camera hardware come back first.
     @objc private func systemDidWake() {
-        guard !paused else { return }
+        guard !paused, !lowPowerSuspended else { return }
         if config.debug { log("系统唤醒") }
         if isRealtime || phase == .tracking {
             // Sleep interrupts the capture session; restarting a running
@@ -422,9 +518,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Actions
 
+    @objc private func setLanguage(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let lang = AppLanguage(rawValue: raw) else { return }
+        config.language = lang
+        L10n.language = lang
+        applyConfig()
+        buildMenu() // recreate every item in the new language
+        if let s = lastSample { render(s) }
+    }
+
     @objc private func recalibrate() {
         monitor.recalibrate()
-        Notifier.notification(title: "坐姿卫士", body: "请以标准坐姿面对屏幕，正在采样校准…")
+        Notifier.notification(
+            title: tr("坐姿卫士", "PostureGuard"),
+            body: tr("请以标准坐姿面对屏幕，正在采样校准…",
+                     "Sit straight facing the screen — calibrating…"))
         if !isRealtime {
             stopAllMonitoring()
             performBurst()
@@ -469,6 +578,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyConfig()
     }
 
+    @objc private func toggleLowPower() {
+        config.runInLowPower.toggle()
+        applyConfig()
+        powerStateChanged() // reconcile suspension with the new setting
+    }
+
     private func applyConfig() {
         config.persist()
         monitor.setConfig(config)
@@ -499,31 +614,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = title
 
         var top: [String] = []
-        if let h = s.headPitchDeg { top.append(String(format: "头部 %+.1f°", h)) }
-        if let n = s.neutralDeg { top.append(String(format: "基准 %+.1f°", n)) }
+        if let h = s.headPitchDeg { top.append(String(format: tr("头部 %+.1f°", "head %+.1f°"), h)) }
+        if let n = s.neutralDeg { top.append(String(format: tr("基准 %+.1f°", "baseline %+.1f°"), n)) }
         var bottom: [String] = []
-        if let lid = s.lidAngle { bottom.append(String(format: "盖角 %.0f°", lid)) }
-        if let p = s.visionPitchDeg { bottom.append(String(format: "人脸 %+.1f°", p)) }
+        if let lid = s.lidAngle { bottom.append(String(format: tr("盖角 %.0f°", "lid %.0f°"), lid)) }
+        if let p = s.visionPitchDeg { bottom.append(String(format: tr("人脸 %+.1f°", "face %+.1f°"), p)) }
         var lines = [top, bottom].filter { !$0.isEmpty }.map { $0.joined(separator: " · ") }
         if !isRealtime {
+            func every(_ seconds: Int) -> String {
+                if L10n.isChinese {
+                    return seconds >= 60 ? "每 \(seconds / 60) 分钟" : "每 \(seconds) 秒"
+                }
+                return seconds >= 60
+                    ? (seconds == 60 ? "every minute" : "every \(seconds / 60) min")
+                    : "every \(seconds) s"
+            }
             var status: String
             switch phase {
             case .tracking:
-                status = "实时跟踪中，恢复坐姿后解除"
+                status = tr("实时跟踪中，恢复坐姿后解除", "Tracking live — clears when posture recovers")
             case .vigilant:
-                let iv = Int(min(vigilantIntervalSec, effectiveCheckInterval))
-                status = "加强观察 · 每 \(iv >= 60 ? "\(iv / 60) 分钟" : "\(iv) 秒")"
+                status = tr("加强观察 · ", "Vigilant · ") + every(Int(min(vigilantIntervalSec, effectiveCheckInterval)))
             case .normal:
-                let iv = effectiveCheckInterval
-                status = iv >= 60 ? "每 \(Int(iv / 60)) 分钟" : "每 \(Int(iv)) 秒"
+                status = every(Int(effectiveCheckInterval))
                 if PowerSource.isOnAC() { status += "⚡" }
             }
             if phase != .tracking, let lc = lastCheck {
-                status += " · 上次 " + Self.timeFmt.string(from: lc)
+                status += tr(" · 上次 ", " · last ") + Self.timeFmt.string(from: lc)
             }
             lines.append(status)
         }
-        let text = lines.isEmpty ? "未检测到人脸" : lines.joined(separator: "\n")
+        let text = lines.isEmpty ? tr("未检测到人脸", "No face detected") : lines.joined(separator: "\n")
         let para = NSMutableParagraphStyle()
         para.lineSpacing = 2
         infoLine.attributedTitle = NSAttributedString(string: text, attributes: [

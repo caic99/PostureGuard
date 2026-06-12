@@ -89,8 +89,16 @@ the live deviation (e.g. `🙇 -17°`).
 
 From the menu you can: recalibrate to your current posture, pause/resume,
 set the alert threshold (10/15/20/25°), set the check interval
-(realtime / 1 / 3 / 5 min), toggle the menu bar angle display, and toggle
-voice alerts.
+(realtime / 1 / 3 / 5 min), toggle the menu bar angle display, toggle voice
+alerts, opt into monitoring during Low Power Mode (off by default — entering
+Low Power Mode suspends detection, shown as `🪑🪫`, and it resumes
+automatically when the mode ends), and switch the UI language
+(system default / 中文 / English).
+
+Voice alerts use `AVSpeechSynthesizer` and automatically pick the
+highest-quality installed voice for the language — download a Premium voice
+in System Settings → Accessibility → Spoken Content → System Voice for the
+best result (Siri voices are not exposed to third-party apps).
 
 ## Debugging
 

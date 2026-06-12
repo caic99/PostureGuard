@@ -23,6 +23,11 @@ struct Config {
     var voice = false
     /// Show the live deviation angle next to the menu bar emoji.
     var showAngle = false
+    /// UI language: follow the system, or force Chinese/English.
+    var language: AppLanguage = .system
+    /// Keep monitoring while the system is in Low Power Mode.
+    /// Off by default: entering Low Power Mode suspends detection.
+    var runInLowPower = false
     var noLid = false
     var debug = false
 
@@ -37,6 +42,8 @@ struct Config {
         if d.object(forKey: "checkIntervalSec") != nil { c.checkIntervalSec = d.double(forKey: "checkIntervalSec") }
         if d.bool(forKey: "voice") { c.voice = true }
         if d.bool(forKey: "showAngle") { c.showAngle = true }
+        if let s = d.string(forKey: "language"), let l = AppLanguage(rawValue: s) { c.language = l }
+        if d.bool(forKey: "runInLowPower") { c.runInLowPower = true }
 
         var args = arguments.dropFirst().makeIterator()
         while let a = args.next() {
@@ -49,9 +56,10 @@ struct Config {
             case "--duration": c.durationSec = args.next().flatMap(Double.init) ?? c.durationSec
             case "--interval": c.sampleInterval = args.next().flatMap(Double.init) ?? c.sampleInterval
             case "--check-interval": c.checkIntervalSec = args.next().flatMap(Double.init) ?? c.checkIntervalSec
+            case "--lang": c.language = args.next().flatMap(AppLanguage.init(rawValue:)) ?? c.language
             case "--reset":
                 ["neutralDeg", "neutralSign", "thresholdDeg", "durationSec", "invertPitch",
-                 "voice", "showAngle", "checkIntervalSec"]
+                 "voice", "showAngle", "checkIntervalSec", "language", "runInLowPower"]
                     .forEach { d.removeObject(forKey: $0) }
                 print("已清除校准数据与设置")
                 exit(0)
@@ -64,6 +72,7 @@ struct Config {
                   --check-interval N  间歇检测周期秒数, 0 = 摄像头常开实时监测 (默认 180)
                   --duration N        [仅实时模式] 持续 N 秒后才提醒 (默认 10)
                   --interval N        摄像头采样间隔秒 (默认 0.5)
+                  --lang X            界面语言 system/zh/en (默认跟随系统)
                   --voice          语音提醒
                   --invert-pitch   反转俯仰方向 (调试时若发现抬头反而报警, 用这个)
                   --no-lid         禁用盖角补偿
@@ -86,5 +95,7 @@ struct Config {
         d.set(checkIntervalSec, forKey: "checkIntervalSec")
         d.set(voice, forKey: "voice")
         d.set(showAngle, forKey: "showAngle")
+        d.set(language.rawValue, forKey: "language")
+        d.set(runInLowPower, forKey: "runInLowPower")
     }
 }

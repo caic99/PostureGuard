@@ -16,8 +16,8 @@ enum PostureError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .noCamera: return "找不到摄像头"
-        case .setupFailed: return "摄像头初始化失败"
+        case .noCamera: return tr("找不到摄像头", "No camera found")
+        case .setupFailed: return tr("摄像头初始化失败", "Camera setup failed")
         }
     }
 }
