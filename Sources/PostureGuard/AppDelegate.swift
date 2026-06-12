@@ -31,6 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastCheck: Date?
     private let burstSec: TimeInterval = 8
     private let burstWarmupFrames = 2
+    /// Calibration runs as a short, densely-sampled burst: ~18 frames in 3 s
+    /// beats the regular 8 s / 2 Hz check statistically and feels instant.
+    private let calibrationBurstSec: TimeInterval = 3
+    private let calibrationSampleInterval: TimeInterval = 0.15
 
     private var trackingStart: Date?
     private var trackingGoodSince: Date?
@@ -226,13 +230,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         burstHeads.removeAll()
         burstVisions.removeAll()
         burstFrames = 0
+        let calibrating = !monitor.isCalibrated
+        let duration = calibrating ? calibrationBurstSec : burstSec
+        detector?.interval = calibrating ? calibrationSampleInterval : config.sampleInterval
         do { try detector?.start() } catch {
             bursting = false
             cameraFailed(error)
             return
         }
-        if config.debug { log("burst #\(id) 开始") }
-        DispatchQueue.main.asyncAfter(deadline: .now() + burstSec) { [weak self] in
+        if config.debug { log("burst #\(id) 开始\(calibrating ? "（校准 \(Int(duration))s 快速采样）" : "")") }
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
             self?.finishBurst(id: id)
         }
     }
@@ -252,6 +259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard bursting, id == burstID else { return }
         bursting = false
         detector?.stop()
+        detector?.interval = config.sampleInterval
         lastCheck = Date()
         if config.debug { log("burst #\(id) 结束: frames=\(burstFrames) 有效=\(burstHeads.count)") }
         // A couple of stray detections (someone walking by) shouldn't count.

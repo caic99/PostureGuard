@@ -40,8 +40,9 @@ true head pitch (vs. horizontal, positive = up)
    median, and shuts off. Idle cost is one timer (~0% CPU, measured); the
    green camera light stays off between checks. On AC power the interval
    automatically shrinks to ⅓ (min 30 s, shown with ⚡ in the menu); on
-   battery it returns to the configured value. The first burst doubles as
-   baseline calibration — just sit straight.
+   battery it returns to the configured value. Calibration (first launch or
+   manual recalibration) runs immediately as a fast 3-second burst — about
+   18 densely-sampled frames, median taken — just sit straight.
 5. **Escalating judgment** — when a check finds your head more than 15°
    (configurable) below the baseline, the app escalates instead of just
    alerting: it switches to **continuous tracking** (camera stays on) until

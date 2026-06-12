@@ -30,11 +30,14 @@ final class FacePitchDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDel
     private let queue = DispatchQueue(label: "posture.camera", qos: .utility)
     private var configured = false
     private var lastProcessed = Date.distantPast
-    private let interval: TimeInterval
+    /// Seconds between processed frames. Written on the main thread before a
+    /// capture session starts (calibration uses a faster rate), read on the
+    /// camera queue.
+    var interval: TimeInterval
     var onReading: ((FaceReading?) -> Void)?
 
     init(interval: TimeInterval) {
-        self.interval = max(0.2, interval)
+        self.interval = max(0.1, interval)
         super.init()
     }
 

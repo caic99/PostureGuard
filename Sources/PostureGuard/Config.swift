@@ -14,8 +14,8 @@ struct Config {
     var pitchSign: Double = -1
     /// EMA smoothing factor for the head pitch signal.
     var smoothing: Double = 0.3
-    /// Seconds of camera frames to collect before auto-calibrating.
-    var autoCalibrateSec: Double = 5
+    /// Seconds of camera frames to collect before auto-calibrating (realtime mode).
+    var autoCalibrateSec: Double = 3
     /// Seconds between processed camera frames.
     var sampleInterval: TimeInterval = 0.5
     /// Seconds between duty-cycle checks; 0 keeps the camera running continuously.

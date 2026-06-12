@@ -53,6 +53,10 @@ final class PostureMonitor {
     var onAlert: ((Double) -> Void)?
     var onCalibrated: ((Double) -> Void)?
 
+    /// Whether a baseline exists. Synchronous so the scheduler can decide
+    /// between a fast calibration burst and a regular check.
+    var isCalibrated: Bool { q.sync { neutral != nil } }
+
     init(config: Config) {
         self.config = config
         if defaults.object(forKey: "neutralDeg") != nil {
