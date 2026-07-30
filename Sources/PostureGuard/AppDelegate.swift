@@ -25,10 +25,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var burstTimer: Timer?
     private var bursting = false
     private var burstID = 0
-    private var burstHeads: [Double] = []
+    private var burstSamples: [(head: Double, compensated: Bool)] = []
     private var burstVisions: [Double] = []
     private var burstFrames = 0
     private var lastCheck: Date?
+    private var calibrationAnnounced = false
+    private var calibRetryNotified = false
+    private var calibRetryCount = 0
+    /// Watchdog for the tracking phase: exits are otherwise sample-driven, so
+    /// a dead capture session would strand the app in .tracking forever.
+    private var trackingWatchdog: Timer?
+    private var lastSampleAt = Date()
     private let burstSec: TimeInterval = 8
     private let burstWarmupFrames = 2
     /// Calibration runs as a short, densely-sampled burst: ~18 frames in 3 s
@@ -111,6 +118,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     body: L10n.isChinese
                         ? String(format: "已校准基准姿势（%.1f°），开始监测", n)
                         : String(format: "Baseline calibrated (%.1f°) — monitoring started", n))
+                // A neutral this low means the head was already bowed during
+                // calibration — the baseline would mask all real slouching.
+                if n < -25 {
+                    Notifier.notification(
+                        title: tr("⚠️ 坐姿卫士", "⚠️ PostureGuard"),
+                        body: tr("基准值异常偏低，校准时可能正在低头，建议坐直后重新校准",
+                                 "Baseline is unusually low — you may have been slouching during calibration. Sit up and recalibrate."))
+                }
+            }
+        }
+        monitor.onCompensationMismatch = { [weak self] in
+            self?.log("盖角数据与校准基准持续不一致，判定已挂起")
+            DispatchQueue.main.async {
+                Notifier.notification(
+                    title: tr("⚠️ 坐姿卫士", "⚠️ PostureGuard"),
+                    body: tr("盖角数据与校准时不一致（传感器异常或屏幕接近合盖），已暂停判定，请重新校准",
+                             "Lid-angle data no longer matches the calibration (sensor issue or lid nearly closed). Judgment paused — please recalibrate."))
             }
         }
 
@@ -122,8 +146,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: .NSProcessInfoPowerStateDidChange, object: nil)
 
         power.onChange = { [weak self] in
+            // monitor.isCalibrated: don't stomp a pending 15 s calibration
+            // retry with a full-interval reschedule.
             guard let self, !self.isRealtime, !self.paused, !self.bursting,
-                  self.phase != .tracking, self.burstTimer != nil else { return }
+                  self.phase != .tracking, self.burstTimer != nil,
+                  self.monitor.isCalibrated else { return }
             if self.config.debug { self.log("电源状态变化 (AC=\(PowerSource.isOnAC()))，重新调度") }
             self.scheduleNextBurst()
         }
@@ -165,11 +192,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .continuous:
                     self.monitor.process(face: face, lidAngle: self.lid?.read())
                 case .burst:
-                    let head = face.flatMap {
+                    let reading = face.flatMap {
                         PostureMonitor.headPitch(face: $0, lid: self.lid?.read(), config: self.config)
                     }
-                    DispatchQueue.main.async { self.collectBurstReading(head: head, vision: face?.pitchDeg) }
+                    DispatchQueue.main.async { self.collectBurstReading(reading, vision: face?.pitchDeg) }
                 }
+            }
+            d.onSessionError = { [weak self] in
+                DispatchQueue.main.async { self?.handleSessionError() }
             }
             detector = d
         }
@@ -185,11 +215,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func stopAllMonitoring() {
         burstTimer?.invalidate()
         burstTimer = nil
+        trackingWatchdog?.invalidate()
+        trackingWatchdog = nil
         bursting = false
         phase = .normal
         trackingStart = nil
         vigilantUntil = nil
+        // An announced-but-never-completed calibration must re-announce after
+        // resume — the user may long since have left their "sit straight" pose.
+        if !monitor.isCalibrated { calibrationAnnounced = false }
         detector?.stop()
+    }
+
+    /// The capture session reported a runtime error (media services reset,
+    /// device contention/disconnect). Recover per mode instead of going silent.
+    private func handleSessionError() {
+        log("摄像头会话错误，尝试恢复")
+        guard !paused, !lowPowerSuspended else { return }
+        if isRealtime {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.isRealtime, !self.paused, !self.lowPowerSuspended else { return }
+                try? self.detector?.start()
+            }
+        } else if phase == .tracking {
+            exitTracking(to: .normal)
+        }
+        // Mid-burst errors need no action: the burst timer still fires,
+        // yields a no-face verdict, and the next check gets scheduled.
     }
 
     private func restartMonitoring() {
@@ -200,12 +252,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Routes every sample from the monitor to the right scheduler reaction.
     private func handleSample(_ s: PostureSample) {
-        // In-flight samples right after a low-power suspension would overwrite
-        // the 🔋 status — drop them.
-        guard !lowPowerSuspended else { return }
+        // In-flight samples right after a suspension or pause would overwrite
+        // the 🪫/⏸ status — drop them.
+        guard !lowPowerSuspended, !paused else { return }
         lastSample = s
         render(s)
-        guard !paused, !isRealtime else { return }
+        guard !isRealtime else { return }
         switch phase {
         case .tracking:
             handleTrackingSample(s)
@@ -220,37 +272,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Burst phase
 
     private func performBurst() {
-        guard !paused, !bursting, !lowPowerSuspended else { return }
+        // !isRealtime matters: a stale delayed re-entry (the 3 s calibration
+        // announce) must not hijack a continuous session the user switched to.
+        guard !paused, !bursting, !lowPowerSuspended, !isRealtime else { return }
+        let calibrating = !monitor.isCalibrated
+        if calibrating && !calibrationAnnounced {
+            // Give the user a moment to settle into the posture this burst
+            // will immortalize as "good" — especially on first launch, right
+            // after they leaned in to click the permission dialog.
+            calibrationAnnounced = true
+            statusItem.button?.title = "🪑📐"
+            Notifier.notification(
+                title: tr("坐姿卫士", "PostureGuard"),
+                body: tr("请以标准坐姿面对屏幕，3 秒后开始校准",
+                         "Sit straight facing the screen — calibrating in 3 seconds"))
+            burstTimer?.invalidate()
+            burstTimer = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.performBurst()
+            }
+            return
+        }
         burstTimer?.invalidate()
         burstTimer = nil
         captureMode = .burst
         bursting = true
         burstID += 1
         let id = burstID
-        burstHeads.removeAll()
+        burstSamples.removeAll()
         burstVisions.removeAll()
         burstFrames = 0
-        let calibrating = !monitor.isCalibrated
         let duration = calibrating ? calibrationBurstSec : burstSec
         detector?.interval = calibrating ? calibrationSampleInterval : config.sampleInterval
         do { try detector?.start() } catch {
             bursting = false
             cameraFailed(error)
+            scheduleNextBurst() // self-heal: retry next interval (camera may appear later)
             return
         }
+        if calibrating { statusItem.button?.title = "🪑📐" }
         if config.debug { log("burst #\(id) 开始\(calibrating ? "（校准 \(Int(duration))s 快速采样）" : "")") }
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
             self?.finishBurst(id: id)
         }
     }
 
-    private func collectBurstReading(head: Double?, vision: Double?) {
+    private func collectBurstReading(_ reading: HeadPitchReading?, vision: Double?) {
         guard bursting else { return }
         burstFrames += 1
         // Skip the first frames while exposure/focus settle.
         guard burstFrames > burstWarmupFrames else { return }
-        if let head {
-            burstHeads.append(head)
+        if let reading {
+            burstSamples.append((reading.deg, reading.lidCompensated))
             if let vision { burstVisions.append(vision) }
         }
     }
@@ -261,10 +334,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         detector?.stop()
         detector?.interval = config.sampleInterval
         lastCheck = Date()
-        if config.debug { log("burst #\(id) 结束: frames=\(burstFrames) 有效=\(burstHeads.count)") }
-        // A couple of stray detections (someone walking by) shouldn't count.
-        let head = burstHeads.count >= 3 ? median(burstHeads) : nil
-        monitor.processBurst(head: head, visionPitch: median(burstVisions), lidAngle: lid?.read())
+        if config.debug { log("burst #\(id) 结束: frames=\(burstFrames) 有效=\(burstSamples.count)") }
+        // Use the majority reference frame within the burst; a couple of stray
+        // detections (someone walking by) shouldn't count either way.
+        let comp = burstSamples.filter { $0.compensated }
+        let uncomp = burstSamples.filter { !$0.compensated }
+        let winner = comp.count >= uncomp.count ? comp : uncomp
+        let head = winner.count >= 3 ? median(winner.map { $0.head }) : nil
+        monitor.processBurst(head: head, compensated: comp.count >= uncomp.count,
+                             visionPitch: median(burstVisions), lidAngle: lid?.read())
     }
 
     private func afterBurst(_ s: PostureSample) {
@@ -272,6 +350,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .slouching, .alerting:
             enterTracking()
         default:
+            // A failed calibration burst (no face seen) shouldn't strand the
+            // app uncalibrated for a whole interval — retry quickly, but cap
+            // the fast loop (launch-and-walk-away would otherwise cycle the
+            // camera every 15 s indefinitely).
+            if !monitor.isCalibrated {
+                calibRetryCount += 1
+                if calibRetryCount <= 8 {
+                    if !calibRetryNotified {
+                        calibRetryNotified = true
+                        Notifier.notification(
+                            title: tr("坐姿卫士", "PostureGuard"),
+                            body: tr("校准时未检测到人脸，15 秒后重试",
+                                     "No face detected during calibration — retrying in 15 s"))
+                    }
+                    burstTimer?.invalidate()
+                    let t = Timer(timeInterval: 15, repeats: false) { [weak self] _ in
+                        self?.performBurst()
+                    }
+                    RunLoop.main.add(t, forMode: .common)
+                    burstTimer = t
+                    return
+                }
+                // Fall through to the normal cadence; calibration happens
+                // whenever a later check finally sees a face.
+            } else {
+                calibRetryCount = 0
+            }
             if phase == .vigilant, let until = vigilantUntil, Date() >= until {
                 phase = .normal
                 vigilantUntil = nil
@@ -309,11 +414,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             phase = .normal
             cameraFailed(error)
             scheduleNextBurst() // keep monitoring alive even if this start failed
+            return
+        }
+        // Wall-clock watchdog: tracking exits are otherwise sample-driven, so
+        // enforce the time cap and detect a silently dead video stream here.
+        lastSampleAt = Date()
+        trackingWatchdog?.invalidate()
+        let t = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+            self?.checkTrackingHealth()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        trackingWatchdog = t
+    }
+
+    private func checkTrackingHealth() {
+        guard phase == .tracking else {
+            trackingWatchdog?.invalidate()
+            trackingWatchdog = nil
+            return
+        }
+        let now = Date()
+        if now.timeIntervalSince(lastSampleAt) > 20 {
+            log("跟踪期间视频流中断 → 回到常规巡检")
+            exitTracking(to: .normal)
+            return
+        }
+        if let start = trackingStart, now.timeIntervalSince(start) >= trackingCapSec {
+            log("实时跟踪达到时长上限 → 转入加强观察")
+            exitTracking(to: .vigilant)
         }
     }
 
     private func handleTrackingSample(_ s: PostureSample) {
         let now = Date()
+        lastSampleAt = now
         let recovered = (s.deviationDeg ?? -999) >= -max(0, config.thresholdDeg - config.hysteresisDeg)
 
         switch s.state {
@@ -323,7 +457,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if now.timeIntervalSince(trackingGoodSince!) >= recoverySec {
                 log("姿势已恢复 → 转入加强观察")
                 exitTracking(to: .vigilant)
-                return
             }
         case .good, .slouching, .alerting, .calibrating:
             trackingGoodSince = nil
@@ -334,19 +467,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if now.timeIntervalSince(trackingNoFaceSince!) >= trackingNoFaceExitSec {
                 log("跟踪期间人已离开 → 回到常规巡检")
                 exitTracking(to: .normal)
-                return
             }
         case .paused:
             return
         }
-
-        if let start = trackingStart, now.timeIntervalSince(start) >= trackingCapSec {
-            log("实时跟踪达到时长上限 → 转入加强观察")
-            exitTracking(to: .vigilant)
-        }
     }
 
     private func exitTracking(to next: Phase) {
+        trackingWatchdog?.invalidate()
+        trackingWatchdog = nil
         detector?.stop()
         captureMode = .burst
         trackingStart = nil
@@ -538,13 +667,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func recalibrate() {
         monitor.recalibrate()
-        Notifier.notification(
-            title: tr("坐姿卫士", "PostureGuard"),
-            body: tr("请以标准坐姿面对屏幕，正在采样校准…",
-                     "Sit straight facing the screen — calibrating…"))
+        calibrationAnnounced = false // performBurst announces and waits 3 s
+        calibRetryNotified = false
+        calibRetryCount = 0
         if !isRealtime {
             stopAllMonitoring()
             performBurst()
+        } else {
+            Notifier.notification(
+                title: tr("坐姿卫士", "PostureGuard"),
+                body: tr("请以标准坐姿面对屏幕，正在采样校准…",
+                         "Sit straight facing the screen — calibrating…"))
         }
     }
 

@@ -35,6 +35,8 @@ final class FacePitchDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDel
     /// camera queue.
     var interval: TimeInterval
     var onReading: ((FaceReading?) -> Void)?
+    /// The session hit a runtime error (media services reset, device lost).
+    var onSessionError: (() -> Void)?
 
     init(interval: TimeInterval) {
         self.interval = max(0.1, interval)
@@ -82,6 +84,12 @@ final class FacePitchDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         output.setSampleBufferDelegate(self, queue: queue)
         guard session.canAddOutput(output) else { throw PostureError.setupFailed }
         session.addOutput(output)
+
+        NotificationCenter.default.addObserver(
+            forName: .AVCaptureSessionRuntimeError, object: session, queue: nil
+        ) { [weak self] _ in
+            self?.onSessionError?()
+        }
     }
 
     func captureOutput(_ output: AVCaptureOutput,

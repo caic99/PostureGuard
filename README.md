@@ -41,8 +41,10 @@ true head pitch (vs. horizontal, positive = up)
    green camera light stays off between checks. On AC power the interval
    automatically shrinks to ⅓ (min 30 s, shown with ⚡ in the menu); on
    battery it returns to the configured value. Calibration (first launch or
-   manual recalibration) runs immediately as a fast 3-second burst — about
-   18 densely-sampled frames, median taken — just sit straight.
+   manual recalibration) prompts you to sit straight, waits 3 seconds, then
+   takes a fast 3-second burst (~18 densely-sampled frames, median taken);
+   it retries in 15 s if no face was seen and warns if the captured baseline
+   looks implausibly low.
 5. **Escalating judgment** — when a check finds your head more than 15°
    (configurable) below the baseline, the app escalates instead of just
    alerting: it switches to **continuous tracking** (camera stays on) until

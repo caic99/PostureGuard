@@ -29,6 +29,14 @@ struct PostureSample {
     var fromBurst = false
 }
 
+/// A head-pitch measurement plus whether lid compensation was applied.
+/// The two are different reference frames (gravity vs camera), so a baseline
+/// captured in one must never be compared against samples from the other.
+struct HeadPitchReading {
+    let deg: Double
+    let lidCompensated: Bool
+}
+
 /// Combines lid angle and face pitch into a gravity-referenced head pitch,
 /// tracks deviation from a calibrated neutral posture, and decides when to alert.
 ///
@@ -43,15 +51,34 @@ final class PostureMonitor {
 
     private var smoothed: Double?
     private var neutral: Double?
-    private var calibrationBuf: [Double] = []
+    /// Whether the persisted baseline includes lid compensation.
+    /// nil = legacy baseline from before this flag existed — adopt the first
+    /// sample's reference frame instead of tripping a false mismatch (on
+    /// lidless Macs the legacy baseline was numerically uncompensated anyway).
+    private var neutralCompensated: Bool?
+    private var calibrationBuf: [(deg: Double, comp: Bool)] = []
     private var calibrationStart: Date?
     private var badSince: Date?
     private var lastAlert: Date?
     private var paused = false
+    private var noFaceSince: Date?
+    /// Brief detection dropouts must not reset the sustained-slouch clock —
+    /// mid-slouch is exactly when Vision loses the face intermittently.
+    private let noFaceGraceSec: TimeInterval = 5
+    /// Consecutive-mismatch weight before warning that lid data no longer
+    /// matches the calibration (20 ≈ 10 s realtime, or 2 bursts at weight 10).
+    private var mismatchStreak = 0
+    /// Re-arm the mismatch warning after a cooldown so a transient HID glitch
+    /// can't permanently consume the only notification.
+    private var lastMismatchNotice: Date?
+    private let mismatchNoticeCooldown: TimeInterval = 1800
 
     var onSample: ((PostureSample) -> Void)?
     var onAlert: ((Double) -> Void)?
     var onCalibrated: ((Double) -> Void)?
+    /// Lid compensation availability flipped vs. the calibrated baseline and
+    /// stayed that way — judgment is suspended; the user should recalibrate.
+    var onCompensationMismatch: (() -> Void)?
 
     /// Whether a baseline exists. Synchronous so the scheduler can decide
     /// between a fast calibration burst and a regular check.
@@ -64,6 +91,7 @@ final class PostureMonitor {
             let storedSign = defaults.object(forKey: "neutralSign") as? Double ?? config.pitchSign
             if storedSign == config.pitchSign {
                 neutral = defaults.double(forKey: "neutralDeg")
+                neutralCompensated = defaults.object(forKey: "neutralComp") as? Bool
             } else {
                 defaults.removeObject(forKey: "neutralDeg")
             }
@@ -78,8 +106,11 @@ final class PostureMonitor {
     /// A bad check never alerts by itself — it reports `.slouching`, which the
     /// scheduler answers by escalating to continuous tracking (`process`),
     /// where the sustained-duration logic confirms and alerts.
-    func processBurst(head: Double?, visionPitch: Double?, lidAngle: Double?) {
-        q.async { self._processBurst(head: head, visionPitch: visionPitch, lidAngle: lidAngle) }
+    func processBurst(head: Double?, compensated: Bool, visionPitch: Double?, lidAngle: Double?) {
+        q.async {
+            self._processBurst(head: head, compensated: compensated,
+                               visionPitch: visionPitch, lidAngle: lidAngle)
+        }
     }
 
     /// Reset per-session signal state before a continuous tracking session so
@@ -88,41 +119,8 @@ final class PostureMonitor {
         q.async {
             self.smoothed = nil
             self.badSince = nil
+            self.noFaceSince = nil
         }
-    }
-
-    private func _processBurst(head: Double?, visionPitch: Double?, lidAngle: Double?) {
-        var sample = PostureSample(lidAngle: lidAngle, visionPitchDeg: visionPitch)
-        sample.fromBurst = true
-        sample.headPitchDeg = head
-        if paused {
-            sample.state = .paused
-            onSample?(sample)
-            return
-        }
-        guard let head else {
-            sample.state = .noFace
-            onSample?(sample)
-            return
-        }
-        guard let neutral else {
-            // The whole burst (median over ~8 s) doubles as the calibration sample.
-            self.neutral = head
-            defaults.set(head, forKey: "neutralDeg")
-            defaults.set(config.pitchSign, forKey: "neutralSign")
-            onCalibrated?(head)
-            sample.neutralDeg = head
-            sample.deviationDeg = 0
-            sample.state = .good
-            onSample?(sample)
-            return
-        }
-        sample.neutralDeg = neutral
-        let deviation = head - neutral
-        sample.deviationDeg = deviation
-
-        sample.state = deviation <= -config.thresholdDeg ? .slouching(seconds: 0) : .good
-        onSample?(sample)
     }
 
     func recalibrate() {
@@ -132,7 +130,12 @@ final class PostureMonitor {
             self.calibrationBuf.removeAll()
             self.calibrationStart = nil
             self.badSince = nil
+            self.noFaceSince = nil
+            self.mismatchStreak = 0
+            self.lastMismatchNotice = nil
             self.defaults.removeObject(forKey: "neutralDeg")
+            self.defaults.removeObject(forKey: "neutralComp")
+            self.neutralCompensated = nil
         }
     }
 
@@ -150,14 +153,19 @@ final class PostureMonitor {
     /// Camera-relative face pitch → gravity-referenced head pitch (positive = up).
     /// Returns nil when the head is turned too far sideways for a reliable pitch.
     /// Lid compensation only applies within a sane open-lid range; outside it
-    /// (clamshell, sensor glitch) the camera-relative value is used as-is.
-    static func headPitch(face: FaceReading, lid: Double?, config: Config) -> Double? {
+    /// (clamshell, sensor glitch) the reading is flagged as uncompensated.
+    static func headPitch(face: FaceReading, lid: Double?, config: Config) -> HeadPitchReading? {
         guard let raw = face.pitchDeg else { return nil }
         if let yaw = face.yawDeg, abs(yaw) > 35 { return nil }
         var h = config.pitchSign * raw
-        if let lid, (45...180).contains(lid) { h += lid - 90 }
-        return h
+        if let lid, (45...180).contains(lid) {
+            h += lid - 90
+            return HeadPitchReading(deg: h, lidCompensated: true)
+        }
+        return HeadPitchReading(deg: h, lidCompensated: false)
     }
+
+    // MARK: - Continuous path
 
     private func _process(face: FaceReading?, lidAngle: Double?) {
         var sample = PostureSample(lidAngle: lidAngle)
@@ -167,12 +175,24 @@ final class PostureMonitor {
             return
         }
         guard let face, let rawPitch = face.pitchDeg,
-              let head = Self.headPitch(face: face, lid: lidAngle, config: config) else {
-            badSince = nil
-            sample.state = .noFace
+              let reading = Self.headPitch(face: face, lid: lidAngle, config: config) else {
+            markNoFace(&sample)
             onSample?(sample)
             return
         }
+        if neutral != nil, !frameMatchesBaseline(reading.lidCompensated) {
+            // Different reference frame than the baseline (lid sensor failed or
+            // recovered mid-session) — comparing would produce a huge phantom
+            // deviation. Suspend judgment on this sample instead.
+            registerMismatch(weight: 1)
+            markNoFace(&sample)
+            onSample?(sample)
+            return
+        }
+        mismatchStreak = 0
+        noFaceSince = nil
+
+        let head = reading.deg
         sample.visionPitchDeg = rawPitch
         sample.faceCenterY = face.centerY
         sample.headPitchDeg = head
@@ -183,15 +203,18 @@ final class PostureMonitor {
 
         guard let neutral else {
             if calibrationStart == nil { calibrationStart = Date() }
-            calibrationBuf.append(head)
+            calibrationBuf.append((head, reading.lidCompensated))
             sample.state = .calibrating
-            if Date().timeIntervalSince(calibrationStart!) >= config.autoCalibrateSec,
-               calibrationBuf.count >= 6 {
-                let median = calibrationBuf.sorted()[calibrationBuf.count / 2]
-                self.neutral = median
-                defaults.set(median, forKey: "neutralDeg")
-                defaults.set(config.pitchSign, forKey: "neutralSign")
-                onCalibrated?(median)
+            if Date().timeIntervalSince(calibrationStart!) >= config.autoCalibrateSec {
+                // Use the majority reference frame — a flaky lid read during
+                // the window must not poison the median with ±(lid-90)° jumps.
+                let comp = calibrationBuf.filter { $0.comp }
+                let uncomp = calibrationBuf.filter { !$0.comp }
+                let winner = comp.count >= uncomp.count ? comp : uncomp
+                if winner.count >= 6 {
+                    let median = winner.map { $0.deg }.sorted()[winner.count / 2]
+                    setNeutral(median, compensated: comp.count >= uncomp.count)
+                }
             }
             onSample?(sample)
             return
@@ -220,5 +243,85 @@ final class PostureMonitor {
             sample.state = .good
         }
         onSample?(sample)
+    }
+
+    // MARK: - Burst path
+
+    private func _processBurst(head: Double?, compensated: Bool, visionPitch: Double?, lidAngle: Double?) {
+        var sample = PostureSample(lidAngle: lidAngle, visionPitchDeg: visionPitch)
+        sample.fromBurst = true
+        sample.headPitchDeg = head
+        if paused {
+            sample.state = .paused
+            onSample?(sample)
+            return
+        }
+        guard let head else {
+            sample.state = .noFace
+            onSample?(sample)
+            return
+        }
+        guard let neutral else {
+            // The whole calibration burst (median over ~18 frames) is the baseline.
+            setNeutral(head, compensated: compensated)
+            sample.neutralDeg = head
+            sample.deviationDeg = 0
+            sample.state = .good
+            onSample?(sample)
+            return
+        }
+        if !frameMatchesBaseline(compensated) {
+            registerMismatch(weight: 10)
+            sample.state = .noFace
+            onSample?(sample)
+            return
+        }
+        mismatchStreak = 0
+
+        sample.neutralDeg = neutral
+        let deviation = head - neutral
+        sample.deviationDeg = deviation
+        sample.state = deviation <= -config.thresholdDeg ? .slouching(seconds: 0) : .good
+        onSample?(sample)
+    }
+
+    // MARK: - Helpers
+
+    private func setNeutral(_ value: Double, compensated: Bool) {
+        neutral = value
+        neutralCompensated = compensated
+        defaults.set(value, forKey: "neutralDeg")
+        defaults.set(config.pitchSign, forKey: "neutralSign")
+        defaults.set(compensated, forKey: "neutralComp")
+        onCalibrated?(value)
+    }
+
+    private func markNoFace(_ sample: inout PostureSample) {
+        if noFaceSince == nil { noFaceSince = Date() }
+        if Date().timeIntervalSince(noFaceSince!) >= noFaceGraceSec {
+            badSince = nil
+        }
+        sample.state = .noFace
+    }
+
+    /// True when the sample's reference frame is usable against the baseline.
+    /// A legacy baseline (nil flag) adopts the first sample's frame once.
+    private func frameMatchesBaseline(_ compensated: Bool) -> Bool {
+        guard let stored = neutralCompensated else {
+            neutralCompensated = compensated
+            defaults.set(compensated, forKey: "neutralComp")
+            return true
+        }
+        return compensated == stored
+    }
+
+    private func registerMismatch(weight: Int) {
+        mismatchStreak += weight
+        guard mismatchStreak >= 20 else { return }
+        if lastMismatchNotice == nil
+            || Date().timeIntervalSince(lastMismatchNotice!) >= mismatchNoticeCooldown {
+            lastMismatchNotice = Date()
+            onCompensationMismatch?()
+        }
     }
 }

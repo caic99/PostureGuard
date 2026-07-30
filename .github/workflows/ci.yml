@@ -11,6 +11,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags needed: make-app.sh derives the version from git describe
 
       - name: Swift version
         run: swift --version

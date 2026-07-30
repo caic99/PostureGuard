@@ -58,8 +58,8 @@ struct Config {
             case "--check-interval": c.checkIntervalSec = args.next().flatMap(Double.init) ?? c.checkIntervalSec
             case "--lang": c.language = args.next().flatMap(AppLanguage.init(rawValue:)) ?? c.language
             case "--reset":
-                ["neutralDeg", "neutralSign", "thresholdDeg", "durationSec", "invertPitch",
-                 "voice", "showAngle", "checkIntervalSec", "language", "runInLowPower"]
+                ["neutralDeg", "neutralSign", "neutralComp", "thresholdDeg", "durationSec",
+                 "invertPitch", "voice", "showAngle", "checkIntervalSec", "language", "runInLowPower"]
                     .forEach { d.removeObject(forKey: $0) }
                 print("已清除校准数据与设置")
                 exit(0)
