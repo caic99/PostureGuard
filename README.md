@@ -57,6 +57,11 @@ true head pitch (vs. horizontal, positive = up)
    judgment is suspended while your head is turned away (|yaw| > 35°). A
    permanent realtime mode (~0.5–1 W) remains available, mainly for
    debugging.
+6. **Automatic yielding** — locking the screen suspends monitoring (`🪑🔒`;
+   an immediate check runs 2 s after unlock instead of waiting out the
+   interval), and checks are skipped while another app (a video call) holds
+   the camera, rescheduled at the normal cadence with a "camera in use" hint
+   in the menu.
 
 ## Install
 
@@ -86,8 +91,8 @@ Launch at login: System Settings → General → Login Items → add
 ## Usage
 
 Menu bar states: `🙆` good posture · `🙇` slouching · `🚨` alert fired ·
-`🪑📐` calibrating · `🪑` no face · `🪑⏸` paused · `🪑📷✕` no camera
-permission. Emoji-only by default; enable "show angle in menu bar" to append
+`🪑📐` calibrating · `🪑` no face · `🪑⏸` paused · `🪑🔒` screen locked ·
+`🪑🪫` low power · `🪑📷✕` no camera permission. Emoji-only by default; enable "show angle in menu bar" to append
 the live deviation (e.g. `🙇 -17°`).
 
 From the menu you can: recalibrate to your current posture, pause/resume,

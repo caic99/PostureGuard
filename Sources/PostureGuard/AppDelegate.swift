@@ -75,6 +75,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastSample: PostureSample?
     /// Monitoring is currently held off because of Low Power Mode.
     private var lowPowerSuspended = false
+    /// The screen is locked — no one to watch, and the green LED at a locked
+    /// screen alarms passers-by.
+    private var isScreenLocked = false
+    /// Consecutive checks skipped because another app held the camera.
+    private var cameraBusySkips = 0
+    /// Bumped by stopAllMonitoring; delayed closures (calibration announce,
+    /// unlock/wake refresh, session-error retry) capture it and abort when
+    /// stale, so no pre-suspension intent can fire after a state change.
+    private var scheduleGeneration = 0
 
     private var lowPowerBlocks: Bool {
         ProcessInfo.processInfo.isLowPowerModeEnabled && !config.runInLowPower
@@ -144,6 +153,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(powerStateChanged),
             name: .NSProcessInfoPowerStateDidChange, object: nil)
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(self, selector: #selector(screenDidLock),
+                        name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+        dnc.addObserver(self, selector: #selector(screenDidUnlock),
+                        name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
+        // Seed the lock state — notifications only report changes, and the app
+        // may have been (re)launched behind an already-locked screen.
+        if let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+           let locked = session["CGSSessionScreenIsLocked"] as? Bool, locked {
+            isScreenLocked = true
+        }
 
         power.onChange = { [weak self] in
             // monitor.isCalibrated: don't stomp a pending 15 s calibration
@@ -184,6 +204,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         lowPowerSuspended = false
+        if isScreenLocked {
+            showLockedStatus()
+            return
+        }
         if detector == nil {
             let d = FacePitchDetector(interval: config.sampleInterval)
             d.onReading = { [weak self] face in
@@ -213,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func stopAllMonitoring() {
+        scheduleGeneration += 1
         burstTimer?.invalidate()
         burstTimer = nil
         trackingWatchdog?.invalidate()
@@ -231,10 +256,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// device contention/disconnect). Recover per mode instead of going silent.
     private func handleSessionError() {
         log("摄像头会话错误，尝试恢复")
-        guard !paused, !lowPowerSuspended else { return }
+        guard !paused, !lowPowerSuspended, !isScreenLocked else { return }
         if isRealtime {
+            let gen = scheduleGeneration
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                guard let self, self.isRealtime, !self.paused, !self.lowPowerSuspended else { return }
+                guard let self, gen == self.scheduleGeneration, self.isRealtime,
+                      !self.paused, !self.lowPowerSuspended, !self.isScreenLocked else { return }
                 try? self.detector?.start()
             }
         } else if phase == .tracking {
@@ -253,8 +280,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Routes every sample from the monitor to the right scheduler reaction.
     private func handleSample(_ s: PostureSample) {
         // In-flight samples right after a suspension or pause would overwrite
-        // the 🪫/⏸ status — drop them.
-        guard !lowPowerSuspended, !paused else { return }
+        // the 🪫/🔒/⏸ status — drop them.
+        guard !lowPowerSuspended, !paused, !isScreenLocked else { return }
         lastSample = s
         render(s)
         guard !isRealtime else { return }
@@ -274,7 +301,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func performBurst() {
         // !isRealtime matters: a stale delayed re-entry (the 3 s calibration
         // announce) must not hijack a continuous session the user switched to.
-        guard !paused, !bursting, !lowPowerSuspended, !isRealtime else { return }
+        guard !paused, !bursting, !lowPowerSuspended, !isScreenLocked, !isRealtime else { return }
+        // Someone else (a video call?) holds the camera — skip this check
+        // rather than piling onto the meeting; keep the normal cadence.
+        if detector?.isCameraBusyElsewhere == true {
+            cameraBusySkips += 1
+            if config.debug { log("摄像头被其他应用使用，跳过本次巡检 (#\(cameraBusySkips))") }
+            // An announced calibration deferred past the call must re-announce.
+            if !monitor.isCalibrated { calibrationAnnounced = false }
+            if let s = lastSample {
+                render(s)
+            } else {
+                setInfoLine(tr("摄像头占用中，暂缓巡检", "Camera in use — checks deferred"))
+            }
+            scheduleNextBurst()
+            return
+        }
+        cameraBusySkips = 0
         let calibrating = !monitor.isCalibrated
         if calibrating && !calibrationAnnounced {
             // Give the user a moment to settle into the posture this burst
@@ -288,8 +331,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                          "Sit straight facing the screen — calibrating in 3 seconds"))
             burstTimer?.invalidate()
             burstTimer = nil
+            let gen = scheduleGeneration
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                self?.performBurst()
+                guard let self, gen == self.scheduleGeneration else { return }
+                self.performBurst()
             }
             return
         }
@@ -348,6 +393,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func afterBurst(_ s: PostureSample) {
         switch s.state {
         case .slouching, .alerting:
+            // A call may have started mid-burst (concurrent camera access is
+            // allowed) — don't pile a continuous tracking session onto it;
+            // keep an eye on things at the vigilant cadence instead.
+            if detector?.isCameraBusyElsewhere == true {
+                cameraBusySkips += 1
+                if config.debug { log("低头但摄像头被占用，暂缓实时跟踪，转加强观察") }
+                phase = .vigilant
+                vigilantUntil = Date().addingTimeInterval(vigilantDurationSec)
+                scheduleNextBurst()
+                return
+            }
             enterTracking()
         default:
             // A failed calibration burst (no face seen) shouldn't strand the
@@ -626,18 +682,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showLowPowerStatus() {
-        statusItem.button?.title = "🪑🪫"
+        showSuspendedStatus("🪑🪫", tr("低电量模式，监测已暂停", "Low Power Mode — monitoring suspended"))
+    }
+
+    private func showLockedStatus() {
+        showSuspendedStatus("🪑🔒", tr("屏幕锁定中，已暂停监测", "Screen locked — monitoring suspended"))
+    }
+
+    private func showSuspendedStatus(_ title: String, _ text: String) {
+        statusItem.button?.title = title
+        setInfoLine(text)
+    }
+
+    private func setInfoLine(_ text: String) {
         let para = NSMutableParagraphStyle()
         para.lineSpacing = 2
         infoLine.attributedTitle = NSAttributedString(
-            string: tr("低电量模式，监测已暂停", "Low Power Mode — monitoring suspended"),
+            string: text,
             attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .paragraphStyle: para])
+    }
+
+    /// Screen lock/unlock: nothing to watch behind a locked screen, and the
+    /// camera LED lighting up at the login window alarms passers-by.
+    @objc private func screenDidLock() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isScreenLocked = true
+            guard !self.paused, !self.lowPowerSuspended else { return }
+            if self.config.debug { self.log("屏幕锁定 → 暂停监测") }
+            self.stopAllMonitoring()
+            self.showLockedStatus()
+        }
+    }
+
+    @objc private func screenDidUnlock() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isScreenLocked = false
+            // While low-power-suspended, leave the 🪫 status alone; the power
+            // observer resumes monitoring (and re-checks the lock) later.
+            guard !self.paused, !self.lowPowerSuspended else { return }
+            if self.config.debug { self.log("屏幕解锁 → 立即巡检") }
+            self.statusItem.button?.title = "🪑…"
+            // Skip the rest of any pre-lock interval; give the camera a moment.
+            let gen = self.scheduleGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, gen == self.scheduleGeneration,
+                      !self.isScreenLocked, !self.paused, !self.bursting else { return }
+                self.startMonitoring()
+            }
+        }
     }
 
     /// On wake, don't sit out the rest of a pre-sleep interval — check now.
     /// A short delay lets the camera hardware come back first.
     @objc private func systemDidWake() {
-        guard !paused, !lowPowerSuspended else { return }
+        // Behind a locked screen, wait for the unlock notification instead.
+        guard !paused, !lowPowerSuspended, !isScreenLocked else { return }
         if config.debug { log("系统唤醒") }
         if isRealtime || phase == .tracking {
             // Sleep interrupts the capture session; restarting a running
@@ -646,8 +747,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         statusItem.button?.title = "🪑…"
+        let gen = scheduleGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-            guard let self, !self.paused, !self.bursting, self.phase != .tracking else { return }
+            guard let self, gen == self.scheduleGeneration,
+                  !self.paused, !self.bursting, self.phase != .tracking else { return }
             if self.config.debug { self.log("系统唤醒 → 立即巡检") }
             self.performBurst()
         }
@@ -782,6 +885,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if phase != .tracking, let lc = lastCheck {
                 status += tr(" · 上次 ", " · last ") + Self.timeFmt.string(from: lc)
+            }
+            if cameraBusySkips > 0 {
+                status += tr(" · 摄像头占用中，暂缓巡检", " · camera in use, checks deferred")
             }
             lines.append(status)
         }

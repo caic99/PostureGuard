@@ -29,6 +29,7 @@ final class FacePitchDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDel
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "posture.camera", qos: .utility)
     private var configured = false
+    private var camera: AVCaptureDevice?
     private var lastProcessed = Date.distantPast
     /// Seconds between processed frames. Written on the main thread before a
     /// capture session starts (calibration uses a faster rate), read on the
@@ -63,6 +64,19 @@ final class FacePitchDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         queue.async { self.session.stopRunning() }
     }
 
+    /// True when another app (a video call, say) currently holds the camera —
+    /// the scheduler skips checks instead of piling onto the meeting.
+    var isCameraBusyElsewhere: Bool {
+        let device = camera
+            ?? AVCaptureDevice.DiscoverySession(
+                deviceTypes: [.builtInWideAngleCamera],
+                mediaType: .video,
+                position: .unspecified
+            ).devices.first
+            ?? AVCaptureDevice.default(for: .video)
+        return device?.isInUseByAnotherApplication ?? false
+    }
+
     private func configure() throws {
         session.sessionPreset = .vga640x480
         // Prefer the built-in camera: lid-angle compensation assumes the camera
@@ -75,6 +89,7 @@ final class FacePitchDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         guard let camera = builtIn ?? AVCaptureDevice.default(for: .video) else {
             throw PostureError.noCamera
         }
+        self.camera = camera
         let input = try AVCaptureDeviceInput(device: camera)
         guard session.canAddInput(input) else { throw PostureError.setupFailed }
         session.addInput(input)
