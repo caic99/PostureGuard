@@ -7,6 +7,10 @@
 
 macOS 菜单栏小工具：**屏幕开合角度 + 人脸朝向** 推算真实低头角度，低头过久时提醒你坐直。
 
+<p align="center">
+  <img src="docs/screenshot.png" width="480" alt="坐姿卫士菜单（渲染示意图）">
+</p>
+
 ## 原理
 
 ```

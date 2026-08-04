@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<!-- Rendered mockup of the PostureGuard menu for the README screenshot.
+     Regenerate with:
+     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+       --headless --screenshot=docs/screenshot.png \
+       --window-size=560,400 --force-device-scale-factor=2 \
+       --default-background-color=00000000 docs/menu-mock.html -->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 560px; height: 400px; }
+  body {
+    font-family: -apple-system, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    background: linear-gradient(135deg, #a8c0e8 0%, #c5b3e0 45%, #e8b8c8 100%);
+    overflow: hidden;
+    border-radius: 14px;
+  }
+  .menubar {
+    height: 30px;
+    background: rgba(252, 252, 253, 0.82);
+    backdrop-filter: blur(20px);
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding: 0 14px;
+    font-size: 13px;
+    color: #1d1d1f;
+    gap: 4px;
+  }
+  .menubar .item { padding: 3px 8px; border-radius: 5px; }
+  .menubar .item.active { background: rgba(0, 0, 0, 0.14); }
+  .menubar .clock { padding: 3px 4px 3px 10px; font-variant-numeric: tabular-nums; }
+  .menu {
+    width: 292px;
+    margin: 6px 96px 0 auto;
+    background: rgba(250, 250, 251, 0.94);
+    backdrop-filter: blur(30px);
+    border-radius: 12px;
+    border: 0.5px solid rgba(0, 0, 0, 0.12);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.12);
+    padding: 5px;
+    font-size: 13px;
+    color: #1d1d1f;
+  }
+  .info {
+    padding: 5px 9px 6px;
+    font-size: 11px;
+    line-height: 1.55;
+    color: #7a7a7e;
+  }
+  .sep { height: 1px; background: rgba(0, 0, 0, 0.09); margin: 4px 9px; }
+  .row {
+    display: flex;
+    align-items: center;
+    padding: 4px 9px;
+    border-radius: 7px;
+    gap: 6px;
+  }
+  .row .label { flex: 1; }
+  .row .key { color: #9a9aa0; font-size: 12.5px; letter-spacing: 1px; }
+  .row .sub { color: #86868b; font-size: 11px; }
+  .row.hover { background: #3478f6; color: #fff; }
+  .row.hover .key { color: rgba(255, 255, 255, 0.75); }
+  .arrow { color: #9a9aa0; font-size: 11px; }
+  .row.hover .arrow { color: rgba(255, 255, 255, 0.75); }
+</style>
+</head>
+<body>
+  <div class="menubar">
+    <div class="item">🔍</div>
+    <div class="item">🎛️</div>
+    <div class="item active">🙆</div>
+    <div class="item">🔋</div>
+    <div class="item">📶</div>
+    <div class="clock">周四 6月11日 17:47</div>
+  </div>
+
+  <div class="menu">
+    <div class="info">
+      头部 +33.2° · 基准 +31.9°<br>
+      盖角 114° · 人脸 −5.4°<br>
+      每 1 分钟⚡ · 上次 17:47
+    </div>
+    <div class="sep"></div>
+    <div class="row hover"><span class="label">以当前姿势重新校准</span><span class="key">⌘C</span></div>
+    <div class="row"><span class="label">暂停监测</span><span class="key">⌘P</span></div>
+    <div class="sep"></div>
+    <div class="row"><span class="label">提醒阈值</span><span class="arrow">▶</span></div>
+    <div class="row"><span class="label">检测间隔</span><span class="arrow">▶</span></div>
+    <div class="row"><span class="label">菜单栏显示角度</span></div>
+    <div class="row"><span class="label">语音提醒</span></div>
+    <div class="row"><span class="label">低电量模式下仍监测</span></div>
+    <div class="row"><span class="label">语言 Language</span><span class="arrow">▶</span></div>
+    <div class="sep"></div>
+    <div class="row"><span class="label">退出</span><span class="key">⌘Q</span></div>
+  </div>
+</body>
+</html>

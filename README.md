@@ -10,6 +10,10 @@ A macOS menu bar utility that catches you slouching. It fuses the MacBook's
 your true head-down angle, and nudges you when you've been hunching over for
 too long.
 
+<p align="center">
+  <img src="docs/screenshot.png" width="480" alt="PostureGuard menu (rendered mockup)">
+</p>
+
 ## How it works
 
 ```
